@@ -43,6 +43,25 @@ import switchboard as sb
 CLASSIFY_LABELS = ["worth saving as durable reusable memory", "not worth saving"]
 
 
+def _rev_prob(url: str, token: str | None, state: str, timeout: int = 30) -> float | None:
+    """POST to Rev's native /score endpoint; return p(save). Rev is deterministic, non-generative."""
+    body=json.dumps({
+        "state": state,
+        "questions": [{"id": "promote", "instructions": sb.DECISION_QUESTION,
+                       "criteria": {"save": CLASSIFY_LABELS[0], "skip": CLASSIFY_LABELS[1]}}],
+    }).encode()
+    headers={"content-type": "application/json"}
+    if token: headers["authorization"]=f"Bearer {token}"
+    req=urllib.request.Request(url.rstrip('/') + '/score', data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data=json.loads(r.read())
+    ans=(data.get("answers") or {}).get("promote") or {}
+    probs=ans.get("probabilities") or {}
+    if "save" in probs:
+        return probs["save"]
+    return 1.0 if ans.get("choice") == "save" else (0.0 if ans.get("choice") == "skip" else None)
+
+
 def _classify_prob(url: str, token: str | None, labels: list[str], state: str, timeout: int = 30) -> float | None:
     """POST to a /v1/classify endpoint (classifier.dev-style); return the score for labels[0]."""
     body=json.dumps({"input": state, "labels": labels}).encode()
@@ -78,6 +97,9 @@ def decide(c: dict, state: str, threshold: float, max_chars: int) -> tuple[bool,
         promote=(prob is not None) and prob >= threshold
     elif c["kind"] == "classify":
         prob=_classify_prob(c["url"], token, c.get("labels") or CLASSIFY_LABELS, state)
+        promote=(prob is not None) and prob >= threshold
+    elif c["kind"] == "rev":
+        prob=_rev_prob(c["url"], token, state)
         promote=(prob is not None) and prob >= threshold
     elif c["kind"] == "generative":
         v=sb.parse_judge_json(sb.call_judge(c["url"], c["model"], token, sb.DECISION_SYSTEM, state))
