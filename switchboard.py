@@ -22,6 +22,7 @@ DEFAULT_DB = os.environ.get(
     str(Path.home() / ".switchboard" / "events.db"),
 )
 DEFAULT_URL = os.environ.get("SWITCHBOARD_URL", "http://127.0.0.1:17888")
+SWITCHBOARD_VERSION = "0.2.0"
 DEFAULT_HOST = os.environ.get("SWITCHBOARD_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("SWITCHBOARD_PORT", "17888"))
 DEFAULT_CMD_LEASE_SECONDS = int(os.environ.get("SWITCHBOARD_CMD_LEASE_SECONDS", "1800"))
@@ -104,6 +105,21 @@ CREATE TABLE IF NOT EXISTS sessions (
   event_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_ws_last ON sessions(workspace, last_seen DESC);
+CREATE TABLE IF NOT EXISTS learnings (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  session_id TEXT,
+  workspace TEXT,
+  harness TEXT,
+  source_machine TEXT,
+  score INTEGER,
+  title TEXT,
+  note TEXT NOT NULL,
+  reason TEXT,
+  model TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_learnings_ws ON learnings(workspace, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_learnings_session ON learnings(session_id);
 CREATE TABLE IF NOT EXISTS workspace_map (
   prefix TEXT PRIMARY KEY,
   workspace TEXT NOT NULL
@@ -1405,6 +1421,47 @@ def print_transcript(args):
     print(transcript(connect(args.db), args.session_id, args.limit))
 
 
+def query_search(args, query, limit):
+    """Return {'learnings': [...], 'events': [...]} from a remote receiver or the local DB."""
+    if getattr(args, 'url', None):
+        data=fetch_remote(args.url, '/search', {'q': query, 'workspace': args.workspace, 'harness': getattr(args,'harness',None), 'project': args.project, 'cwd_prefix': args.cwd_prefix, 'limit': limit}, args.token)
+        return {"learnings": data.get('learnings', []), "events": data.get('events', [])}
+    con=connect(args.db)
+    return {
+        "learnings": search_learnings(con, query, workspace=args.workspace, limit=limit),
+        "events": search_events(con, query, workspace=args.workspace, harness=getattr(args,'harness',None), project=args.project, cwd_prefix=args.cwd_prefix, limit=limit),
+    }
+
+
+def print_search(args):
+    res=query_search(args, args.query, args.limit)
+    if getattr(args, 'json', False):
+        print(json.dumps(res, indent=2, ensure_ascii=False)); return
+    ln=res["learnings"]; evs=res["events"]
+    if not ln and not evs:
+        print(f"No matches for {args.query!r}."); return
+    if ln:
+        print("LEARNINGS")
+        for l in ln:
+            print(f"  [{l.get('score')}] {l.get('title') or '(untitled)'}  ({l.get('workspace')} · {l.get('created_at')})")
+            note=(l.get('note') or '').strip().replace('\n', '\n    ')
+            print(f"    {note[:600]}")
+    if evs:
+        print("EVENTS")
+        for e in evs:
+            print(f"  {e.get('ts')} {e.get('source_machine')}/{e.get('harness')} ws={e.get('workspace')} {e.get('role')}/{e.get('event_type')} session={e.get('session_id')}")
+            print(f"    {e.get('snippet')}")
+
+
+def print_learnings(args):
+    if getattr(args, 'url', None):
+        data=fetch_remote(args.url, '/learnings', {'workspace': args.workspace, 'limit': args.limit}, args.token)
+        rows=data.get('learnings', [])
+    else:
+        rows=list_learnings(connect(args.db), args.workspace, args.limit)
+    print(json.dumps(rows, indent=2, ensure_ascii=False))
+
+
 def latest(con, workspace=None, limit=20, since_seconds=None, project=None, cwd_prefix=None):
     args=[]; where=[]
     if workspace: where.append("workspace=?"); args.append(workspace)
@@ -1424,6 +1481,90 @@ def sessions(con, workspace=None, limit=10, project=None, cwd_prefix=None):
     return [rowdict(r) for r in con.execute(sql,args).fetchall()]
 
 
+def _snippet(text: str | None, terms: list[str], width: int = 240) -> str:
+    """A window of `text` around the first matching term, for search output."""
+    text=(text or "").replace("\r", " ").replace("\n", " ").strip()
+    if not text: return ""
+    low=text.lower()
+    pos=min((low.find(t.lower()) for t in terms if low.find(t.lower()) >= 0), default=-1)
+    if pos < 0 or len(text) <= width:
+        return text[:width] + ("…" if len(text) > width else "")
+    start=max(0, pos - width // 3)
+    end=min(len(text), start + width)
+    return ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
+
+
+def search_events(con, query, workspace=None, limit=20, project=None, cwd_prefix=None, harness=None):
+    """Substring search over event text. Space-separated terms are AND-ed."""
+    terms=[t for t in (query or "").split() if t]
+    if not terms: return []
+    args=[]; where=["text IS NOT NULL AND text!=''"]
+    if workspace: where.append("workspace=?"); args.append(workspace)
+    if harness:
+        ch=canonical_harness(harness) or harness
+        where.append("harness=?"); args.append(ch)
+    where.extend(project_where(project, cwd_prefix, args))
+    for t in terms:
+        where.append("text LIKE ? ESCAPE '\\'"); args.append("%" + t.replace("\\","\\\\").replace("%","\\%").replace("_","\\_") + "%")
+    sql="SELECT * FROM events WHERE " + " AND ".join(where) + " ORDER BY ts DESC LIMIT ?"
+    args.append(limit)
+    hits=[]
+    for r in con.execute(sql, args).fetchall():
+        d=rowdict(r)
+        hits.append({
+            "session_id": d.get("session_id"), "ts": d.get("ts"),
+            "source_machine": d.get("source_machine"), "harness": d.get("harness"),
+            "workspace": d.get("workspace"), "role": d.get("role"),
+            "event_type": d.get("event_type"), "snippet": _snippet(d.get("text"), terms),
+        })
+    return hits
+
+
+def search_learnings(con, query, workspace=None, limit=20):
+    """Substring search over promoted learning notes. Terms are AND-ed."""
+    terms=[t for t in (query or "").split() if t]
+    args=[]; where=[]
+    if workspace: where.append("workspace=?"); args.append(workspace)
+    for t in terms:
+        esc="%" + t.replace("\\","\\\\").replace("%","\\%").replace("_","\\_") + "%"
+        where.append("(title LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\')"); args.extend([esc, esc])
+    sql="SELECT * FROM learnings" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY score DESC, created_at DESC LIMIT ?"
+    args.append(limit)
+    return [rowdict(r) for r in con.execute(sql, args).fetchall()]
+
+
+def list_learnings(con, workspace=None, limit=50):
+    args=[]; where=[]
+    if workspace: where.append("workspace=?"); args.append(workspace)
+    sql="SELECT * FROM learnings" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT ?"
+    args.append(limit)
+    return [rowdict(r) for r in con.execute(sql, args).fetchall()]
+
+
+def promote_learning(con, payload: dict[str, Any]) -> dict[str, Any]:
+    ws=canonical_workspace(con, payload.get("cwd"), payload.get("workspace"))
+    row={
+        "id": payload.get("id") or uuid.uuid4().hex,
+        "created_at": payload.get("created_at") or now_iso(),
+        "session_id": payload.get("session_id"),
+        "workspace": ws,
+        "harness": payload.get("harness"),
+        "source_machine": payload.get("source_machine"),
+        "score": payload.get("score"),
+        "title": (payload.get("title") or "")[:400],
+        "note": (payload.get("note") or "")[:16000],
+        "reason": (payload.get("reason") or "")[:2000],
+        "model": payload.get("model"),
+    }
+    if not row["note"]:
+        raise ValueError("learning note is required")
+    con.execute(
+        """INSERT OR REPLACE INTO learnings(id, created_at, session_id, workspace, harness, source_machine, score, title, note, reason, model)
+           VALUES (:id,:created_at,:session_id,:workspace,:harness,:source_machine,:score,:title,:note,:reason,:model)""",
+        row,
+    )
+    con.commit()
+    return row
 
 
 def capsule_rowdict(r: sqlite3.Row) -> dict[str, Any]:
@@ -1804,6 +1945,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             evs=payload if isinstance(payload,list) else payload.get('events',[payload])
             con=connect(self.db_path); ins,sk=ingest_events(con, evs); con.close()
             self._send(200,{"inserted":ins,"skipped":sk}); return
+        if u.path == '/learnings':
+            if not require_command_auth(self): return
+            try: payload=parse_json_body(self)
+            except ValueError as e: self._send(400,{"error":str(e)}); return
+            con=connect(self.db_path)
+            try:
+                try:
+                    row=promote_learning(con, payload)
+                except ValueError as e:
+                    self._send(400,{"error":str(e)}); return
+                self._send(200,{"id":row["id"]}); return
+            finally: con.close()
         if u.path == '/commands':
             if not require_command_auth(self): return
             try: payload=parse_json_body(self)
@@ -2105,6 +2258,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 since=q.get('since_seconds',[None])[0]
                 self._send(200,{"events": latest(con, q.get('workspace',[None])[0], int(q.get('limit',[20])[0]), since_seconds=float(since) if since else None, project=q.get('project',[None])[0], cwd_prefix=q.get('cwd_prefix',[None])[0])}); return
             if u.path == '/sessions': self._send(200,{"sessions": sessions(con, q.get('workspace',[None])[0], int(q.get('limit',[10])[0]), project=q.get('project',[None])[0], cwd_prefix=q.get('cwd_prefix',[None])[0])}); return
+            if u.path == '/search':
+                query=q.get('q',[q.get('query',[''])[0]])[0]
+                ws=q.get('workspace',[None])[0]; lim=int(q.get('limit',[20])[0])
+                self._send(200,{
+                    "learnings": search_learnings(con, query, workspace=ws, limit=lim),
+                    "events": search_events(con, query, workspace=ws, harness=q.get('harness',[None])[0], project=q.get('project',[None])[0], cwd_prefix=q.get('cwd_prefix',[None])[0], limit=lim),
+                }); return
+            if u.path == '/learnings': self._send(200,{"learnings": list_learnings(con, q.get('workspace',[None])[0], int(q.get('limit',[50])[0]))}); return
             if u.path == '/digest': self._send(200,{"digest": digest_text(con, q.get('workspace',[None])[0], int(q.get('limit',[8])[0]), project=q.get('project',[None])[0], cwd_prefix=q.get('cwd_prefix',[None])[0])}); return
             if u.path.startswith('/transcript/'):
                 sid=urllib.parse.unquote(u.path.split('/',2)[2])
@@ -2426,11 +2587,6 @@ def execute_command(command: dict[str, Any], timeout: int) -> tuple[int, str, st
         )
         output = (proc.stdout or "") + (proc.stderr or "")
         return proc.returncode, output_tail(cwd_note + output) or "", None
-    if verb in VALID_COMMAND_VERBS:
-        from stage_runner import execute_stage
-
-        exit_code, output, session_id = execute_stage({**command, "cwd": cwd}, timeout=timeout)
-        return exit_code, output_tail(cwd_note + output) or "", session_id
     return 2, f"unknown verb: {verb}", None
 
 
@@ -2749,6 +2905,191 @@ def relay(args):
         time.sleep(args.interval)
 
 
+# ---------- eval / learning promotion (local-model judge) ----------
+
+EVAL_SYSTEM = (
+    "You are a strict reviewer of coding-agent work sessions. Given a session transcript, judge how "
+    "useful and reusable the session is as durable memory for a FUTURE agent, and distill its "
+    "transferable knowledge. Score 1-10: 1 = trivial/noise (chit-chat, aborted, nothing learned), "
+    "10 = a hard problem solved with a non-obvious fix, decision, or gotcha worth remembering. "
+    "Reply with ONLY a JSON object, no prose: "
+    '{"score": <int 1-10>, "reason": "<one sentence>", "title": "<=8 words>", '
+    '"note": "<2-6 sentences: what was done, the key decisions, any gotcha, and how to apply it next time>"}'
+)
+
+
+def call_judge(base_url: str, model: str, api_key: str | None, system: str, user: str, timeout: int = 180) -> str:
+    body=json.dumps({
+        "model": model,
+        "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+        "temperature": 0.2,
+        "max_tokens": 900,
+    }).encode()
+    headers={"content-type":"application/json"}
+    if api_key: headers["authorization"]=f"Bearer {api_key}"
+    req=urllib.request.Request(base_url.rstrip('/') + '/chat/completions', data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data=json.loads(r.read())
+    return data["choices"][0]["message"].get("content") or ""
+
+
+def parse_judge_json(text: str) -> dict[str, Any]:
+    text=(text or "").strip()
+    if text.startswith("```"):
+        text=re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text=re.sub(r"\n?```$", "", text).strip()
+    m=re.search(r"\{.*\}", text, re.DOTALL)
+    if m: text=m.group(0)
+    return json.loads(text)
+
+
+def eval_cli(args):
+    base_url=args.base_url or os.environ.get("SWITCHBOARD_EVAL_BASE_URL")
+    model=args.model or os.environ.get("SWITCHBOARD_EVAL_MODEL", "local")
+    api_key=args.api_key or os.environ.get("SWITCHBOARD_EVAL_API_KEY")
+    if not base_url:
+        raise SystemExit("set --base-url or SWITCHBOARD_EVAL_BASE_URL to an OpenAI-compatible endpoint")
+    con=None if args.url else connect(args.db)
+    if args.session:
+        targets=[{"session_id": args.session}]
+    elif args.url:
+        targets=fetch_remote(args.url, '/sessions', {'workspace': args.workspace, 'limit': args.limit}, args.token).get('sessions', [])
+    else:
+        targets=sessions(con, args.workspace, args.limit)
+    notes_dir=Path(args.notes_dir or os.environ.get("SWITCHBOARD_NOTES_DIR", str(Path.home()/".switchboard"/"notes"))).expanduser()
+    results=[]
+    for s in targets:
+        sid=s["session_id"]
+        if args.url:
+            tx=fetch_remote(args.url, '/transcript/' + urllib.parse.quote(sid, safe=''), {'limit': args.transcript_limit}, args.token).get('transcript','')
+        else:
+            tx=transcript(con, sid, args.transcript_limit)
+        if not tx or tx.startswith("No events"):
+            results.append({"session_id": sid, "skipped": "no transcript"}); continue
+        try:
+            verdict=parse_judge_json(call_judge(base_url, model, api_key, EVAL_SYSTEM, tx[:args.max_chars]))
+        except Exception as e:
+            results.append({"session_id": sid, "error": f"{type(e).__name__}: {e}"}); continue
+        score=int(verdict.get("score") or 0)
+        entry={"session_id": sid, "score": score, "title": verdict.get("title"), "reason": verdict.get("reason"), "promoted": False}
+        if args.promote and score >= args.threshold and verdict.get("note"):
+            payload={
+                "session_id": sid, "workspace": s.get("workspace") or args.workspace, "cwd": s.get("cwd"),
+                "harness": s.get("harness"), "source_machine": s.get("source_machine"), "score": score,
+                "title": verdict.get("title"), "note": verdict.get("note"), "reason": verdict.get("reason"), "model": model,
+            }
+            if args.url:
+                command_http(args.url, "POST", "/learnings", payload, token=args.token)
+            else:
+                promote_learning(con, payload)
+            notes_dir.mkdir(parents=True, exist_ok=True)
+            fn=notes_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', sid)}.md"
+            fn.write_text(
+                f"---\nsession: {sid}\nworkspace: {payload['workspace']}\nharness: {payload['harness']}\n"
+                f"score: {score}\nmodel: {model}\n---\n\n# {verdict.get('title') or 'Learning'}\n\n"
+                f"{verdict.get('note')}\n\n_{verdict.get('reason','')}_\n"
+            )
+            entry["promoted"]=True; entry["note_file"]=str(fn)
+        results.append(entry)
+    print(json.dumps(results, indent=2, ensure_ascii=False))
+
+
+# ---------- MCP server (stdio JSON-RPC 2.0; stdlib only) ----------
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+
+def mcp_tools() -> list[dict[str, Any]]:
+    return [
+        {"name": "switchboard_search",
+         "description": "Search durable learnings and raw session events across every agent harness and machine by keyword. Use this to recall what any past session (Claude Code, Codex, etc.) did about a topic before starting related work.",
+         "inputSchema": {"type": "object", "properties": {
+             "query": {"type": "string", "description": "space-separated keywords, AND-ed together"},
+             "workspace": {"type": "string"}, "harness": {"type": "string"},
+             "limit": {"type": "integer", "default": 15}}, "required": ["query"]}},
+        {"name": "switchboard_digest",
+         "description": "A compact cross-harness summary of the most recent agent sessions and what each was doing.",
+         "inputSchema": {"type": "object", "properties": {"workspace": {"type": "string"}, "limit": {"type": "integer", "default": 8}}}},
+        {"name": "switchboard_sessions",
+         "description": "List recent agent sessions across every harness and machine, newest first.",
+         "inputSchema": {"type": "object", "properties": {"workspace": {"type": "string"}, "limit": {"type": "integer", "default": 10}}}},
+        {"name": "switchboard_latest",
+         "description": "The most recent events across sessions, newest first.",
+         "inputSchema": {"type": "object", "properties": {"workspace": {"type": "string"}, "limit": {"type": "integer", "default": 20}}}},
+        {"name": "switchboard_transcript",
+         "description": "Replay one session's transcript by its session_id (get ids from switchboard_search/sessions).",
+         "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}, "limit": {"type": "integer", "default": 200}}, "required": ["session_id"]}},
+    ]
+
+
+def mcp_dispatch_tool(args, name: str, ta: dict[str, Any]) -> str:
+    """Run one MCP tool and return a text result. Prefers the receiver; falls back to local sqlite."""
+    ws=ta.get("workspace"); limit=int(ta.get("limit") or 20); url=getattr(args, 'url', None); token=getattr(args, 'token', None)
+    try:
+        if name == "switchboard_search":
+            query=ta.get("query", "")
+            if url:
+                data=fetch_remote(url, '/search', {'q': query, 'workspace': ws, 'harness': ta.get('harness'), 'limit': limit}, token)
+            else:
+                con=connect(args.db)
+                data={"learnings": search_learnings(con, query, workspace=ws, limit=limit),
+                      "events": search_events(con, query, workspace=ws, harness=ta.get('harness'), limit=limit)}
+            return json.dumps(data, ensure_ascii=False, indent=2)
+        if name == "switchboard_digest":
+            if url: return fetch_remote(url, '/digest', {'workspace': ws, 'limit': limit}, token).get('digest', '')
+            return digest_text(connect(args.db), ws, limit)
+        if name == "switchboard_sessions":
+            rows=fetch_remote(url, '/sessions', {'workspace': ws, 'limit': limit}, token).get('sessions', []) if url else sessions(connect(args.db), ws, limit)
+            return json.dumps(rows, ensure_ascii=False, indent=2)
+        if name == "switchboard_latest":
+            rows=fetch_remote(url, '/latest', {'workspace': ws, 'limit': limit}, token).get('events', []) if url else latest(connect(args.db), ws, limit)
+            return json.dumps(rows, ensure_ascii=False, indent=2)
+        if name == "switchboard_transcript":
+            sid=ta.get("session_id"); tlim=int(ta.get("limit") or 200)
+            if url: return fetch_remote(url, '/transcript/' + urllib.parse.quote(sid, safe=''), {'limit': tlim}, token).get('transcript', '')
+            return transcript(connect(args.db), sid, tlim)
+    except (urllib.error.URLError, ConnectionError):
+        if url:  # receiver unreachable — degrade to local sqlite
+            return mcp_dispatch_tool(argparse.Namespace(**{**vars(args), 'url': None}), name, ta)
+        raise
+    raise ValueError(f"unknown tool: {name}")
+
+
+def mcp_serve(args):
+    def send(obj): sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n"); sys.stdout.flush()
+    for line in sys.stdin:
+        line=line.strip()
+        if not line: continue
+        try: msg=json.loads(line)
+        except Exception: continue
+        method=msg.get("method"); mid=msg.get("id"); is_notification="id" not in msg
+        try:
+            if method == "initialize":
+                send({"jsonrpc": "2.0", "id": mid, "result": {
+                    "protocolVersion": (msg.get("params") or {}).get("protocolVersion") or MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "switchboard", "version": SWITCHBOARD_VERSION}}})
+            elif method in ("notifications/initialized", "notifications/cancelled"):
+                pass
+            elif method == "ping":
+                send({"jsonrpc": "2.0", "id": mid, "result": {}})
+            elif method == "tools/list":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"tools": mcp_tools()}})
+            elif method == "tools/call":
+                params=msg.get("params") or {}
+                name=params.get("name"); ta=params.get("arguments") or {}
+                try:
+                    text=mcp_dispatch_tool(args, name, ta)
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": text or "(no result)"}]}})
+                except Exception as e:
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"error: {type(e).__name__}: {e}"}], "isError": True}})
+            elif not is_notification:
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"method not found: {method}"}})
+        except Exception as e:
+            if not is_notification:
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(e)}})
+
+
 def main(argv=None):
     ap=argparse.ArgumentParser(description='switchboard live handoff bus')
     ap.add_argument('--db', default=DEFAULT_DB)
@@ -2759,6 +3100,22 @@ def main(argv=None):
     s=sub.add_parser('sessions'); add_filter_args(s); s.add_argument('--limit',type=int,default=10); s.set_defaults(func=print_sessions)
     s=sub.add_parser('digest'); add_filter_args(s); s.add_argument('--limit',type=int,default=8); s.set_defaults(func=print_digest)
     s=sub.add_parser('transcript'); s.add_argument('session_id'); s.add_argument('--limit',type=int,default=200); s.add_argument('--url', default=DEFAULT_URL); s.add_argument('--token'); s.set_defaults(func=print_transcript)
+    s=sub.add_parser('search', help='keyword search over learnings + session events'); add_filter_args(s); s.add_argument('query'); s.add_argument('--harness'); s.add_argument('--limit',type=int,default=15); s.add_argument('--json',action='store_true'); s.set_defaults(func=print_search)
+    s=sub.add_parser('learnings', help='list promoted durable learnings'); s.add_argument('--workspace'); s.add_argument('--limit',type=int,default=50); s.add_argument('--url',default=DEFAULT_URL); s.add_argument('--token'); s.set_defaults(func=print_learnings)
+    s=sub.add_parser('eval', help='score sessions with a local model and promote good ones to learnings')
+    s.add_argument('--session', help='score this exact session_id (else the most recent sessions)')
+    s.add_argument('--workspace'); s.add_argument('--limit',type=int,default=5,help='sessions to score when --session is omitted')
+    s.add_argument('--transcript-limit',type=int,default=400); s.add_argument('--max-chars',type=int,default=24000)
+    s.add_argument('--base-url',help='OpenAI-compatible endpoint (or SWITCHBOARD_EVAL_BASE_URL)')
+    s.add_argument('--model',help='judge model (or SWITCHBOARD_EVAL_MODEL, default "local")')
+    s.add_argument('--api-key',help='or SWITCHBOARD_EVAL_API_KEY')
+    s.add_argument('--threshold',type=int,default=7,help='promote sessions scoring >= this (1-10)')
+    s.add_argument('--promote',action='store_true',help='write learnings for sessions that clear the threshold')
+    s.add_argument('--notes-dir',help='markdown mirror dir (or SWITCHBOARD_NOTES_DIR)')
+    s.add_argument('--url',default=DEFAULT_URL); s.add_argument('--token'); s.set_defaults(func=eval_cli)
+    s=sub.add_parser('mcp', help='run an MCP server (stdio JSON-RPC) exposing search/digest/sessions/latest/transcript')
+    s.add_argument('--url',default=None,help='query a remote receiver instead of the local DB (falls back to local if unreachable)')
+    s.add_argument('--token'); s.set_defaults(func=mcp_serve)
     s=sub.add_parser('trigger')
     s.add_argument('--url', default=DEFAULT_URL or f'http://{DEFAULT_HOST}:{DEFAULT_PORT}')
     s.add_argument('--token')
