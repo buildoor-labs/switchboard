@@ -73,15 +73,19 @@ objective outcome check (a session whose last exit code was non-zero is not prom
 **non-duplication** (a near-identical existing learning blocks it).
 
 The decision is *pluggable*. By default the same generative model makes it, but point
-`--decision-url` at a **non-generative typed-decision endpoint** (Jev-style — e.g.
-[Ollaya](https://github.com/ollaya-dev/ollaya) serving a Rev/Laya head at `/v1/decisions`) and
-the gate becomes a calibrated, split-second classifier while the generative model is used only
-to write notes for the winners.
+`--decision-url` at a **non-generative typed-decision endpoint** speaking TypeSafe's
+`/v1/systemone` API and the gate becomes a calibrated, split-second classifier while the
+generative model is used only to write notes for the winners. That endpoint can be hosted
+(the [LangSmith Gateway](https://docs.langchain.com/langsmith/llm-gateway-decision-models),
+serving models like `semif-qwen3.5-4b` or `typesafe/jev-*`) or self-hosted
+([Ollaya](https://github.com/ollaya-dev/ollaya) serving a Rev/Laya head).
 
 ```bash
 export SWITCHBOARD_EVAL_BASE_URL=http://localhost:8080/v1   # generative model: note synthesis (+ decision fallback)
-# optional: a fast typed-decision model as the gate
-export SWITCHBOARD_DECISION_URL=http://localhost:8090       # Ollaya/TypeSafe-compatible /v1/decisions
+# optional: a fast typed-decision model as the gate (hosted example)
+export SWITCHBOARD_DECISION_URL=https://gateway.smith.langchain.com
+export SWITCHBOARD_DECISION_MODEL=semif-qwen3.5-4b
+export SWITCHBOARD_DECISION_TOKEN=$LANGSMITH_API_KEY
 switchboard eval --workspace acme --limit 10 --promote --threshold 7
 switchboard search "connection pool exhaustion"
 ```
@@ -144,8 +148,9 @@ All via environment variables:
 | `SWITCHBOARD_CMD_TOKEN` | unset — the receiver is open on localhost; set a bearer token to require auth once you expose it |
 | `SWITCHBOARD_EVAL_BASE_URL` | unset — OpenAI-compatible endpoint for `switchboard eval` (e.g. a local model) |
 | `SWITCHBOARD_EVAL_MODEL` | `local` — the synthesis model name |
-| `SWITCHBOARD_DECISION_URL` | unset — a Jev-style typed-decision endpoint (`/v1/decisions`) used as the promotion gate; falls back to the generative model when unset |
-| `SWITCHBOARD_DECISION_TOKEN` | unset — bearer token for the decision endpoint |
+| `SWITCHBOARD_DECISION_URL` | unset — a TypeSafe `/v1/systemone` typed-decision endpoint used as the promotion gate; falls back to the generative model when unset |
+| `SWITCHBOARD_DECISION_MODEL` | `semif-qwen3.5-4b` — decision model name at that endpoint |
+| `SWITCHBOARD_DECISION_TOKEN` | unset — bearer token for the decision endpoint (e.g. a LangSmith API key) |
 | `SWITCHBOARD_EVAL_API_KEY` | unset — sent as a bearer token to the eval endpoint if set |
 | `SWITCHBOARD_NOTES_DIR` | `~/.switchboard/notes` — where promoted learnings are mirrored as markdown |
 | `SWITCHBOARD_REDACT` | `1` — scrub secrets from stored text at ingest; set `0`/`false` to disable |

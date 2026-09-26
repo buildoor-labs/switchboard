@@ -3295,19 +3295,45 @@ def parse_judge_json(text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
-def call_decision_endpoint(url: str, token: str | None, question: str, options: list[str], context: str, timeout: int = 30) -> dict[str, Any]:
-    """POST to a Jev-style typed-decision endpoint (Ollaya / TypeSafe `/v1/decisions`-compatible).
-    Non-generative: returns a chosen option + confidence, not prose. Parsed leniently across shapes."""
-    body=json.dumps({"question": question, "options": options, "input": context, "context": context}).encode()
-    headers={"content-type":"application/json"}
+DECISION_QUESTION = (
+    "This is a coding-agent session transcript. Should it be saved as durable, reusable memory "
+    "for a future agent — i.e. did it solve a real, non-obvious problem and leave transferable "
+    "knowledge (a fix, decision, or gotcha)? Idle chat, aborted, or trivial work should not be saved."
+)
+
+
+def _extract_prob(ans: Any) -> float | None:
+    """Pull a 0..1 probability/confidence out of a systemone `noul` answer, whatever the shape."""
+    if isinstance(ans, bool):
+        return 1.0 if ans else 0.0
+    if isinstance(ans, (int, float)):
+        return float(ans)
+    if isinstance(ans, dict):
+        for k in ("probability", "prob", "confidence", "score", "value", "p_true", "true"):
+            v=ans.get(k)
+            if isinstance(v, bool):
+                return 1.0 if v else 0.0
+            if isinstance(v, (int, float)):
+                return float(v)
+    return None
+
+
+def call_decision_endpoint(url: str, token: str | None, model: str, state: str, timeout: int = 30) -> dict[str, Any]:
+    """POST to a TypeSafe `/v1/systemone` typed-decision endpoint (LangSmith Gateway / Ollaya / Jev).
+    Non-generative: a `noul` question returns the probability the session is worth saving."""
+    body=json.dumps({
+        "state": state,
+        "model": model,
+        "questions": {"promote": {"type": "noul", "instructions": DECISION_QUESTION}},
+    }).encode()
+    headers={"content-type": "application/json"}
     if token: headers["authorization"]=f"Bearer {token}"
-    req=urllib.request.Request(url.rstrip('/') + '/v1/decisions', data=body, headers=headers)
+    req=urllib.request.Request(url.rstrip('/') + '/v1/systemone', data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data=json.loads(r.read())
-    res=data.get("result") if isinstance(data.get("result"), dict) else data
-    choice=res.get("choice") or res.get("decision") or res.get("label") or res.get("answer")
-    conf=res.get("confidence"); conf=res.get("score") if conf is None else conf
-    return {"choice": choice, "confidence": conf, "raw": data}
+    answers=data.get("answers") if isinstance(data.get("answers"), dict) else data
+    prob=_extract_prob(answers.get("promote") if isinstance(answers, dict) else None)
+    return {"probability": prob, "raw": data}
 
 
 def decide_session(args, tx: str, base_url: str, model: str, api_key: str | None) -> dict[str, Any]:
@@ -3315,17 +3341,13 @@ def decide_session(args, tx: str, base_url: str, model: str, api_key: str | None
     decision_url=args.decision_url or os.environ.get("SWITCHBOARD_DECISION_URL")
     decision_token=args.decision_token or os.environ.get("SWITCHBOARD_DECISION_TOKEN")
     if decision_url:
-        d=call_decision_endpoint(decision_url, decision_token,
-            "Is this coding-agent session worth saving as durable, reusable memory?",
-            ["promote", "skip"], tx[:args.max_chars])
-        choice=str(d.get("choice") or "").lower(); conf=d.get("confidence")
-        promote=choice.startswith("promote") or choice in ("yes", "true", "1")
-        if isinstance(conf, (int, float)):
-            score=int(round(conf*10)) if 0 <= conf <= 1 else int(conf)
-        else:
-            score=8 if promote else 2
-        return {"backend": "decision-endpoint", "promote": promote, "score": score,
-                "outcome": None, "title": None, "reason": f"decision-endpoint choice={d.get('choice')} confidence={conf}"}
+        decision_model=args.decision_model or os.environ.get("SWITCHBOARD_DECISION_MODEL", "semif-qwen3.5-4b")
+        d=call_decision_endpoint(decision_url, decision_token, decision_model, tx[:args.max_chars])
+        prob=d.get("probability")
+        promote=(prob is not None) and prob >= (args.threshold / 10.0)
+        score=int(round(prob*10)) if isinstance(prob, (int, float)) else 0
+        return {"backend": f"decision:{decision_model}", "promote": promote, "score": score,
+                "outcome": None, "title": None, "reason": f"decision p(save)={prob}"}
     v=parse_judge_json(call_judge(base_url, model, api_key, DECISION_SYSTEM, tx[:args.max_chars]))
     return {"backend": "generative", "promote": bool(v.get("promote")), "score": int(v.get("score") or 0),
             "outcome": v.get("outcome"), "title": v.get("title"), "reason": v.get("reason")}
@@ -3567,8 +3589,9 @@ def main(argv=None):
     s.add_argument('--base-url',help='OpenAI-compatible endpoint for note synthesis + generative decision fallback (or SWITCHBOARD_EVAL_BASE_URL)')
     s.add_argument('--model',help='synthesis model (or SWITCHBOARD_EVAL_MODEL, default "local")')
     s.add_argument('--api-key',help='or SWITCHBOARD_EVAL_API_KEY')
-    s.add_argument('--decision-url',help='Jev-style typed-decision endpoint (Ollaya/TypeSafe /v1/decisions); if unset, the generative model makes the decision (or SWITCHBOARD_DECISION_URL)')
-    s.add_argument('--decision-token',help='bearer token for the decision endpoint (or SWITCHBOARD_DECISION_TOKEN)')
+    s.add_argument('--decision-url',help='TypeSafe /v1/systemone typed-decision endpoint (LangSmith Gateway https://gateway.smith.langchain.com, or self-hosted Ollaya); if unset, the generative model decides (or SWITCHBOARD_DECISION_URL)')
+    s.add_argument('--decision-model',help='decision model name, e.g. semif-qwen3.5-4b (or SWITCHBOARD_DECISION_MODEL)')
+    s.add_argument('--decision-token',help='bearer token for the decision endpoint, e.g. LANGSMITH_API_KEY (or SWITCHBOARD_DECISION_TOKEN)')
     s.add_argument('--threshold',type=int,default=7,help='promote sessions scoring >= this (1-10)')
     s.add_argument('--promote',action='store_true',help='write learnings for sessions that clear the threshold')
     s.add_argument('--notes-dir',help='markdown mirror dir (or SWITCHBOARD_NOTES_DIR)')
