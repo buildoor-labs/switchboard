@@ -293,6 +293,67 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+_FTS5_AVAILABLE: bool | None = None
+
+
+def fts5_available() -> bool:
+    """Whether this SQLite build has FTS5. Cached. SWITCHBOARD_NO_FTS5 forces the LIKE path."""
+    global _FTS5_AVAILABLE
+    if os.environ.get("SWITCHBOARD_NO_FTS5"):
+        return False
+    if _FTS5_AVAILABLE is None:
+        try:
+            t = sqlite3.connect(":memory:")
+            t.execute("CREATE VIRTUAL TABLE _probe USING fts5(x)")
+            t.close()
+            _FTS5_AVAILABLE = True
+        except sqlite3.OperationalError:
+            _FTS5_AVAILABLE = False
+    return _FTS5_AVAILABLE
+
+
+FTS_SCHEMA = r"""
+CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(text, content='events', content_rowid='rowid', tokenize='porter unicode61');
+CREATE TRIGGER IF NOT EXISTS events_fts_ai AFTER INSERT ON events BEGIN
+  INSERT INTO events_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS events_fts_ad AFTER DELETE ON events BEGIN
+  INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS events_fts_au AFTER UPDATE ON events BEGIN
+  INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+  INSERT INTO events_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE VIRTUAL TABLE IF NOT EXISTS learnings_fts USING fts5(title, note, content='learnings', content_rowid='rowid', tokenize='porter unicode61');
+CREATE TRIGGER IF NOT EXISTS learnings_fts_ai AFTER INSERT ON learnings BEGIN
+  INSERT INTO learnings_fts(rowid, title, note) VALUES (new.rowid, new.title, new.note);
+END;
+CREATE TRIGGER IF NOT EXISTS learnings_fts_ad AFTER DELETE ON learnings BEGIN
+  INSERT INTO learnings_fts(learnings_fts, rowid, title, note) VALUES('delete', old.rowid, old.title, old.note);
+END;
+"""
+
+
+def setup_fts(con: sqlite3.Connection) -> None:
+    """Create the FTS5 mirror tables + sync triggers, backfilling any table we just created.
+
+    count(*) on an external-content FTS table delegates to the content table, so it can't
+    tell an empty index from a full one; we key the one-time backfill off table creation.
+    """
+    if not fts5_available():
+        return
+    existing = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    con.executescript(FTS_SCHEMA)
+    for fts in ("events_fts", "learnings_fts"):
+        if fts not in existing:  # first creation over (possibly) pre-existing rows
+            con.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+
+
+def fts_match_query(terms: list[str]) -> str:
+    """AND of quoted terms, so FTS operators in user input are treated as literal text."""
+    return " AND ".join('"' + t.replace('"', '""') + '"' for t in terms)
+
+
 def connect(db: str = DEFAULT_DB) -> sqlite3.Connection:
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db)
@@ -329,6 +390,7 @@ def connect(db: str = DEFAULT_DB) -> sqlite3.Connection:
             pass
     for prefix, ws in DEFAULT_MAP.items():
         con.execute("INSERT OR IGNORE INTO workspace_map(prefix, workspace) VALUES (?,?)", (prefix, ws))
+    setup_fts(con)
     con.commit()
     return con
 
@@ -1494,35 +1556,54 @@ def _snippet(text: str | None, terms: list[str], width: int = 240) -> str:
     return ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
 
 
+def _event_hit(d: dict[str, Any], terms: list[str]) -> dict[str, Any]:
+    return {
+        "session_id": d.get("session_id"), "ts": d.get("ts"),
+        "source_machine": d.get("source_machine"), "harness": d.get("harness"),
+        "workspace": d.get("workspace"), "role": d.get("role"),
+        "event_type": d.get("event_type"), "snippet": _snippet(d.get("text"), terms),
+    }
+
+
 def search_events(con, query, workspace=None, limit=20, project=None, cwd_prefix=None, harness=None):
-    """Substring search over event text. Space-separated terms are AND-ed."""
+    """Ranked full-text search over event text (FTS5), or substring fallback. Terms are AND-ed."""
     terms=[t for t in (query or "").split() if t]
     if not terms: return []
+    ch=(canonical_harness(harness) or harness) if harness else None
+    if fts5_available():
+        args=[fts_match_query(terms)]; where=["events_fts MATCH ?"]
+        if workspace: where.append("workspace=?"); args.append(workspace)
+        if ch: where.append("harness=?"); args.append(ch)
+        where.extend(project_where(project, cwd_prefix, args))
+        sql="SELECT e.* FROM events_fts JOIN events e ON e.rowid=events_fts.rowid WHERE " + " AND ".join(where) + " ORDER BY bm25(events_fts) LIMIT ?"
+        args.append(limit)
+        try:
+            return [_event_hit(rowdict(r), terms) for r in con.execute(sql, args).fetchall()]
+        except sqlite3.OperationalError:
+            pass  # malformed MATCH etc. — fall through to LIKE
     args=[]; where=["text IS NOT NULL AND text!=''"]
     if workspace: where.append("workspace=?"); args.append(workspace)
-    if harness:
-        ch=canonical_harness(harness) or harness
-        where.append("harness=?"); args.append(ch)
+    if ch: where.append("harness=?"); args.append(ch)
     where.extend(project_where(project, cwd_prefix, args))
     for t in terms:
         where.append("text LIKE ? ESCAPE '\\'"); args.append("%" + t.replace("\\","\\\\").replace("%","\\%").replace("_","\\_") + "%")
     sql="SELECT * FROM events WHERE " + " AND ".join(where) + " ORDER BY ts DESC LIMIT ?"
     args.append(limit)
-    hits=[]
-    for r in con.execute(sql, args).fetchall():
-        d=rowdict(r)
-        hits.append({
-            "session_id": d.get("session_id"), "ts": d.get("ts"),
-            "source_machine": d.get("source_machine"), "harness": d.get("harness"),
-            "workspace": d.get("workspace"), "role": d.get("role"),
-            "event_type": d.get("event_type"), "snippet": _snippet(d.get("text"), terms),
-        })
-    return hits
+    return [_event_hit(rowdict(r), terms) for r in con.execute(sql, args).fetchall()]
 
 
 def search_learnings(con, query, workspace=None, limit=20):
-    """Substring search over promoted learning notes. Terms are AND-ed."""
+    """Ranked full-text search over learning title+note (FTS5), or substring fallback."""
     terms=[t for t in (query or "").split() if t]
+    if terms and fts5_available():
+        args=[fts_match_query(terms)]; where=["learnings_fts MATCH ?"]
+        if workspace: where.append("l.workspace=?"); args.append(workspace)
+        sql="SELECT l.* FROM learnings_fts JOIN learnings l ON l.rowid=learnings_fts.rowid WHERE " + " AND ".join(where) + " ORDER BY bm25(learnings_fts) LIMIT ?"
+        args.append(limit)
+        try:
+            return [rowdict(r) for r in con.execute(sql, args).fetchall()]
+        except sqlite3.OperationalError:
+            pass
     args=[]; where=[]
     if workspace: where.append("workspace=?"); args.append(workspace)
     for t in terms:
