@@ -1,0 +1,7 @@
+[
+  {"name": "jev-classifier.dev", "kind": "classify", "url": "https://classifier.dev", "_note": "free tier, no key; serves jev-1.13.0"},
+  {"name": "semif-4b",   "kind": "systemone",  "url": "https://gateway.smith.langchain.com", "model": "semif-qwen3.5-4b",     "token_env": "LANGSMITH_API_KEY"},
+  {"name": "jev-1.13",   "kind": "systemone",  "url": "https://gateway.smith.langchain.com", "model": "typesafe/jev-1.13.0", "token_env": "LANGSMITH_API_KEY"},
+  {"name": "decider-4b", "kind": "systemone",  "url": "http://127.0.0.1:8000",                "model": "Mapika/decider-4b"},
+  {"name": "gen-27b",    "kind": "generative", "url": "http://127.0.0.1:8080/v1",             "model": "local"}
+]
