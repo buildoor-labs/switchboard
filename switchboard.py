@@ -88,7 +88,12 @@ CREATE TABLE IF NOT EXISTS events (
   raw_json TEXT NOT NULL,
   source_path TEXT,
   source_line INTEGER,
-  source_offset INTEGER
+  source_offset INTEGER,
+  collection_method TEXT,
+  fidelity TEXT,
+  tool_call_id TEXT,
+  content_sha256 TEXT,
+  content_len INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_events_ws_ts ON events(workspace, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_events_session_ts ON events(session_id, ts DESC);
@@ -373,7 +378,9 @@ def connect(db: str = DEFAULT_DB) -> sqlite3.Connection:
         if "idempotency_key" not in command_columns:
             con.execute("ALTER TABLE command_queue ADD COLUMN idempotency_key TEXT")
     con.executescript(SCHEMA)
-    for col, typ in [("source_path", "TEXT"), ("source_line", "INTEGER"), ("source_offset", "INTEGER")]:
+    for col, typ in [("source_path", "TEXT"), ("source_line", "INTEGER"), ("source_offset", "INTEGER"),
+                     ("collection_method", "TEXT"), ("fidelity", "TEXT"), ("tool_call_id", "TEXT"),
+                     ("content_sha256", "TEXT"), ("content_len", "INTEGER")]:
         try:
             con.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
@@ -538,6 +545,7 @@ def normalize_claude_line(obj: dict[str, Any], source_machine: str, fallback_har
     command = None
     exit_code = None
     file_path = None
+    tool_call_id = obj.get("tool_call_id") or obj.get("toolCallId") or obj.get("tool_use_id")
 
     # Codex JSONL: {type, payload:{...}}
     if "payload" in obj and isinstance(obj.get("payload"), dict):
@@ -558,6 +566,7 @@ def normalize_claude_line(obj: dict[str, Any], source_machine: str, fallback_har
             text = text_from_content(payload.get("content") or payload.get("message") or payload.get("text") or payload)[:4000]
             if payload.get("type") in {"function_call", "custom_tool_call", "exec_command"}:
                 event_type = "tool_use"; role = "tool"; tool_name = payload.get("name") or payload.get("type"); command = payload.get("command")
+                tool_call_id = tool_call_id or payload.get("call_id") or payload.get("id")
             elif payload.get("type") in {"function_call_output", "custom_tool_call_output", "exec_command_output"}:
                 event_type = "tool_result"; role = "tool"; text = text_from_content(payload.get("output") or payload)[:4000]
         else:
@@ -576,6 +585,7 @@ def normalize_claude_line(obj: dict[str, Any], source_machine: str, fallback_har
                 if isinstance(item, dict) and item.get("type") in {"toolCall", "tool_use"}:
                     event_type = "tool_use"
                     tool_name = item.get("name") or tool_name
+                    tool_call_id = tool_call_id or item.get("id") or item.get("toolCallId")
                     inp = item.get("arguments") or item.get("input") or {}
                     command = inp.get("command") if isinstance(inp, dict) else None
                     file_path = inp.get("file_path") or inp.get("path") if isinstance(inp, dict) else None
@@ -655,6 +665,9 @@ def normalize_claude_line(obj: dict[str, Any], source_machine: str, fallback_har
         "command": command,
         "exit_code": exit_code,
         "file_path": file_path,
+        "tool_call_id": tool_call_id,
+        "collection_method": "poll",
+        "fidelity": "observed",
         "raw": obj,
         "source_path": source_path,
         "source_line": obj.get("_source_line"),
@@ -665,17 +678,140 @@ def normalize_claude_line(obj: dict[str, Any], source_machine: str, fallback_har
     return base
 
 
+# ---------- privacy: secret redaction + retention ----------
+
+# Labeled secret: `api_key: xyz`, `token=xyz`, `Authorization: Bearer xyz`, etc. Group 3 is the value;
+# an optional `bearer` keyword between the separator and the value is swallowed, not mistaken for it.
+_SECRET_LABELED = re.compile(
+    r"(?i)\b(authorization|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret|password|passwd|bearer|token|client[_-]?secret|private[_-]?key)\b"
+    r"(\s*[:=]\s*|\s+)(?:bearer\s+)?"
+    r"([A-Za-z0-9._\-+/=]{6,})"
+)
+# Unlabeled high-entropy provider keys worth catching on their own.
+_SECRET_STANDALONE = [
+    re.compile(r"\bsk-[A-Za-z0-9._\-]{20,}\b"),          # OpenAI-style
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),             # GitHub PAT
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),     # Slack
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                 # AWS access key id
+]
+_REDACTION = "«redacted»"
+
+
+def redaction_enabled() -> bool:
+    return os.environ.get("SWITCHBOARD_REDACT", "1").lower() not in ("0", "false", "no", "off")
+
+
+def redact_secrets(text: str | None) -> str | None:
+    """Scrub secrets from free text. When a labeled secret's value is redacted, any bare
+    reuse of that same value later in the string is scrubbed too."""
+    if not text:
+        return text
+    captured: list[str] = []
+
+    def _labeled(m: re.Match) -> str:
+        val = m.group(3)
+        if len(val) >= 6:
+            captured.append(val)
+        return f"{m.group(1)}{m.group(2)}{_REDACTION}"
+
+    out = _SECRET_LABELED.sub(_labeled, text)
+    for pat in _SECRET_STANDALONE:
+        out = pat.sub(_REDACTION, out)
+    for val in captured:  # scrub bare reuse of an already-captured secret value
+        if val and val not in ("bearer",):
+            out = out.replace(val, _REDACTION)
+    return out
+
+
+def retention_mode() -> str:
+    m = os.environ.get("SWITCHBOARD_RETENTION", "full").lower()
+    return m if m in ("full", "redacted", "metadata_only") else "full"
+
+
+def _apply_privacy(text: str | None, mode: str) -> str | None:
+    """Return the text to store given the retention mode + redaction policy."""
+    if mode == "metadata_only":
+        return None
+    if text is None:
+        return None
+    if mode == "redacted" or redaction_enabled():  # 'redacted' forces redaction on regardless of the flag
+        text = redact_secrets(text)
+    return text
+
+
+_METHOD_PRIORITY = {"hook": 3, "otlp": 2, "plugin": 1, "poll": 0}
+
+
+def _method_priority(method: str | None) -> int:
+    return _METHOD_PRIORITY.get(method or "poll", 0)
+
+
+def _dedup_match(con: sqlite3.Connection, e: dict[str, Any], method: str) -> tuple[str | None, str | None]:
+    """Find an existing event this one duplicates across capture paths.
+
+    A shared non-empty tool-call id (same event_type + session) is authoritative — no window.
+    Otherwise, only ACROSS different capture methods, collapse same (event_type, session, target)
+    within a short window (10s for a completion, 2s otherwise). Same-method events never collapse.
+    Returns (existing_event_id, existing_method) or (None, None).
+    """
+    sid = e.get("session_id"); et = e.get("event_type"); tcid = e.get("tool_call_id")
+    if tcid:
+        row = con.execute(
+            "SELECT event_id, collection_method FROM events WHERE tool_call_id=? AND event_type=? AND session_id=? LIMIT 1",
+            (tcid, et, sid),
+        ).fetchone()
+        if row:
+            return row["event_id"], row["collection_method"]
+    target = e.get("tool_name") or e.get("file_path") or e.get("command")
+    if not target:
+        return None, None
+    window = 10 if (et or "").endswith(("completed", "result")) else 2
+    center = parse_iso_seconds(e.get("ts")) or time.time()
+    lo = datetime.fromtimestamp(center - window, timezone.utc).isoformat().replace("+00:00", "Z")
+    hi = datetime.fromtimestamp(center + window, timezone.utc).isoformat().replace("+00:00", "Z")
+    row = con.execute(
+        """SELECT event_id, collection_method FROM events
+           WHERE session_id=? AND event_type=? AND collection_method IS NOT ?
+             AND ts BETWEEN ? AND ?
+             AND COALESCE(tool_name, file_path, command, '') = ? LIMIT 1""",
+        (sid, et, method, lo, hi, target),
+    ).fetchone()
+    return (row["event_id"], row["collection_method"]) if row else (None, None)
+
+
 def ingest_events(con: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> tuple[int, int]:
     inserted = 0; skipped = 0
+    mode = retention_mode()
     for e in events:
         if not e: continue
         ws = canonical_workspace(con, e.get("cwd"), e.get("workspace"))
         raw_json = json.dumps(e.get("raw", e), ensure_ascii=False, sort_keys=True)[:65536]
+        method = e.get("collection_method") or "poll"
+        fidelity = e.get("fidelity") or "observed"
+        # Content markers reflect the ORIGINAL text (before redaction/truncation).
+        original = e.get("text") or ""
+        content_sha256 = hashlib.sha256(original.encode("utf-8", "replace")).hexdigest() if original else None
+        content_len = len(original.encode("utf-8", "replace")) if original else 0
+        stored_text = _apply_privacy(original, mode)
+        stored_text = stored_text[:8000] if stored_text is not None else None
+        stored_command = e.get("command")
+        if mode == "metadata_only":
+            stored_command = None
+        elif stored_command and (mode == "redacted" or redaction_enabled()):
+            stored_command = redact_secrets(stored_command)
+        # Cross-path dedup: collapse the same action captured by another method.
+        dup_id, dup_method = _dedup_match(con, e, method)
+        if dup_id is not None:
+            if _method_priority(method) > _method_priority(dup_method):
+                con.execute("DELETE FROM events WHERE event_id=?", (dup_id,))  # keep the higher-fidelity row
+            else:
+                skipped += 1
+                continue
         try:
             con.execute(
-                """INSERT INTO events(event_id, ts, received_at, source_machine, harness, workspace, cwd, session_id, role, event_type, text, tool_name, command, exit_code, file_path, raw_json, source_path, source_line, source_offset)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (e["event_id"], e.get("ts") or now_iso(), now_iso(), e.get("source_machine") or "unknown", e.get("harness") or "unknown", ws, e.get("cwd"), e["session_id"], e.get("role"), e.get("event_type"), (e.get("text") or "")[:8000], e.get("tool_name"), e.get("command"), e.get("exit_code"), e.get("file_path"), raw_json, e.get("source_path"), e.get("source_line"), e.get("source_offset")),
+                """INSERT INTO events(event_id, ts, received_at, source_machine, harness, workspace, cwd, session_id, role, event_type, text, tool_name, command, exit_code, file_path, raw_json, source_path, source_line, source_offset, collection_method, fidelity, tool_call_id, content_sha256, content_len)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (e["event_id"], e.get("ts") or now_iso(), now_iso(), e.get("source_machine") or "unknown", e.get("harness") or "unknown", ws, e.get("cwd"), e["session_id"], e.get("role"), e.get("event_type"), stored_text, e.get("tool_name"), stored_command, e.get("exit_code"), e.get("file_path"), raw_json, e.get("source_path"), e.get("source_line"), e.get("source_offset"), method, fidelity, e.get("tool_call_id"), content_sha256, content_len),
             )
             inserted += 1
             con.execute(
@@ -688,7 +824,7 @@ def ingest_events(con: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> 
                      workspace=COALESCE(excluded.workspace, sessions.workspace),
                      cwd=COALESCE(excluded.cwd, sessions.cwd),
                      event_count=event_count+1""",
-                (e["session_id"], e.get("source_machine") or "unknown", e.get("harness") or "unknown", ws, e.get("cwd"), e.get("ts") or now_iso(), e.get("ts") or now_iso(), e.get("role"), (e.get("text") or "")[:1000]),
+                (e["session_id"], e.get("source_machine") or "unknown", e.get("harness") or "unknown", ws, e.get("cwd"), e.get("ts") or now_iso(), e.get("ts") or now_iso(), e.get("role"), (stored_text or "")[:1000]),
             )
         except sqlite3.IntegrityError:
             skipped += 1
@@ -2900,6 +3036,135 @@ def task_worker(args):
             time.sleep(args.interval)
 
 
+# ---------- live capture via harness hooks (Claude Code) ----------
+
+HOOK_MARKER = "switchboard.py hook"  # identifies our entries in a settings file for idempotent install/uninstall
+
+
+def _hook_event_from_claude(payload: dict[str, Any], event: str, source_machine: str) -> dict[str, Any] | None:
+    """Normalize a Claude Code hook stdin payload into a switchboard event (collection_method=hook).
+
+    Claude Code hands hooks: session_id, transcript_path, cwd, hook_event_name, plus per-event
+    fields (PreToolUse: tool_name/tool_input; PostToolUse: + tool_response; UserPromptSubmit: prompt;
+    PermissionRequest: tool_name/tool_input + a decision). We observe, we never gate.
+    """
+    sid = payload.get("session_id") or payload.get("sessionId")
+    if not sid:
+        return None
+    cwd = payload.get("cwd")
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    tcid = payload.get("tool_use_id") or payload.get("tool_call_id") or tool_input.get("tool_use_id")
+    role = "system"; command = None; file_path = None; text = ""; et = event
+    if event in ("PreToolUse", "PostToolUse", "PermissionRequest"):
+        role = "tool"
+        command = tool_input.get("command")
+        file_path = tool_input.get("file_path") or tool_input.get("path")
+        et = "tool_use" if event == "PreToolUse" else ("tool_result" if event == "PostToolUse" else "approval.requested")
+        text = json.dumps(tool_input, ensure_ascii=False)[:4000] or (tool_name or event)
+        decision = payload.get("permission_decision") or payload.get("decision") or extract_path(payload, "permissionDecision")
+        if event == "PermissionRequest" and decision:
+            d = str(decision).lower()
+            et = "approval.allowed" if d in ("allow", "approve", "allowed") else ("approval.denied" if d in ("deny", "block", "denied") else "approval.requested")
+            reason = payload.get("permission_decision_reason") or payload.get("reason")
+            text = f"{tool_name}: {decision}" + (f" — {reason}" if reason else "")
+    elif event == "UserPromptSubmit":
+        role = "user"; et = "prompt.submitted"; text = str(payload.get("prompt") or "")
+    elif event in ("Stop", "SubagentStop"):
+        role = "system"; et = "session.stop"; text = event
+    else:
+        text = json.dumps(payload, ensure_ascii=False)[:2000]
+    base = {
+        "ts": now_iso(), "source_machine": source_machine, "harness": "claude-code",
+        "workspace": None, "cwd": cwd, "session_id": str(sid), "role": role, "event_type": et,
+        "text": text, "tool_name": tool_name, "command": command, "exit_code": None,
+        "file_path": file_path, "tool_call_id": tcid, "collection_method": "hook",
+        "fidelity": "observed", "raw": payload, "source_path": payload.get("transcript_path"),
+    }
+    key_src = json.dumps(["hook", source_machine, sid, et, tcid, tool_name, base["ts"], text[:200]], sort_keys=True, ensure_ascii=False)
+    base["event_id"] = hashlib.sha256(key_src.encode()).hexdigest()[:32]
+    return base
+
+
+def hook_cli(args):
+    """Ingest one harness hook event from stdin, then print an observe-only pass response."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    ev = _hook_event_from_claude(payload, args.event, args.source_machine) if isinstance(payload, dict) else None
+    if ev:
+        try:
+            if args.url:
+                post_events(args.url, [ev], args.token)
+            else:
+                con = connect(args.db); ingest_events(con, [ev]); con.close()
+        except Exception as e:  # never let capture break the host tool
+            print(f"switchboard hook: {type(e).__name__}: {e}", file=sys.stderr)
+    # Observe-only: proceed without altering the permission decision (we are not a gate).
+    sys.stdout.write(json.dumps({"continue": True, "suppressOutput": True}) + "\n")
+
+
+def _claude_settings_path(args) -> Path:
+    return Path(args.settings).expanduser() if getattr(args, "settings", None) else Path.home() / ".claude" / "settings.json"
+
+
+HOOK_EVENTS_TOOL = ("PreToolUse", "PostToolUse")  # get a "*" matcher
+HOOK_EVENTS_PLAIN = ("UserPromptSubmit", "Stop")   # no matcher
+
+
+def _switchboard_hook_group(event: str, url: str | None, matcher: bool) -> dict[str, Any]:
+    script = Path(__file__).resolve()
+    cmd = f"{sys.executable} {script} hook {event}" + (f" --url {url}" if url else "")
+    group: dict[str, Any] = {"hooks": [{"type": "command", "command": cmd, "timeout": 10}]}
+    if matcher:
+        group = {"matcher": "*", **group}
+    return group
+
+
+def _is_switchboard_group(group: dict[str, Any]) -> bool:
+    return any(HOOK_MARKER in (h.get("command") or "") for h in group.get("hooks", []) if isinstance(h, dict))
+
+
+def hooks_cli(args):
+    if args.action == "install":
+        path = _claude_settings_path(args)
+        settings = {}
+        if path.exists():
+            settings = json.loads(path.read_text() or "{}")
+        hooks = settings.setdefault("hooks", {})
+        added = []
+        for event in HOOK_EVENTS_TOOL + HOOK_EVENTS_PLAIN:
+            groups = hooks.setdefault(event, [])
+            groups[:] = [g for g in groups if not _is_switchboard_group(g)]  # replace any prior switchboard entry
+            groups.append(_switchboard_hook_group(event, args.url, matcher=event in HOOK_EVENTS_TOOL))
+            added.append(event)
+        if args.dry_run:
+            print(json.dumps(settings, indent=2)); return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, indent=2) + "\n")
+        print(json.dumps({"installed": added, "settings": str(path)}, indent=2))
+    elif args.action == "uninstall":
+        path = _claude_settings_path(args)
+        if not path.exists():
+            print(json.dumps({"removed": [], "settings": str(path)})); return
+        settings = json.loads(path.read_text() or "{}")
+        hooks = settings.get("hooks", {})
+        removed = []
+        for event, groups in list(hooks.items()):
+            kept = [g for g in groups if not (isinstance(g, dict) and _is_switchboard_group(g))]
+            if len(kept) != len(groups):
+                removed.append(event)
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+        if args.dry_run:
+            print(json.dumps(settings, indent=2)); return
+        path.write_text(json.dumps(settings, indent=2) + "\n")
+        print(json.dumps({"removed": removed, "settings": str(path)}, indent=2))
+
+
 def ingest_file(args):
     con=connect(args.db); evs=[]
     for n,line in enumerate(Path(args.path).open(errors='ignore'), start=1):
@@ -3197,6 +3462,17 @@ def main(argv=None):
     s=sub.add_parser('mcp', help='run an MCP server (stdio JSON-RPC) exposing search/digest/sessions/latest/transcript')
     s.add_argument('--url',default=None,help='query a remote receiver instead of the local DB (falls back to local if unreachable)')
     s.add_argument('--token'); s.set_defaults(func=mcp_serve)
+    s=sub.add_parser('hook', help='ingest one harness hook event from stdin (live capture); prints an observe-only pass response')
+    s.add_argument('event', help='hook event name, e.g. PreToolUse / PostToolUse / UserPromptSubmit / Stop / PermissionRequest')
+    s.add_argument('--url', help='post to a receiver instead of the local DB'); s.add_argument('--token')
+    s.add_argument('--source-machine', default=os.uname().nodename); s.set_defaults(func=hook_cli)
+    s=sub.add_parser('hooks', help='install/uninstall switchboard capture hooks in a harness settings file')
+    s.add_argument('action', choices=['install', 'uninstall'])
+    s.add_argument('--harness', default='claude', choices=['claude'], help='only Claude Code is supported for now')
+    s.add_argument('--settings', help='settings file to edit (default ~/.claude/settings.json)')
+    s.add_argument('--url', help='receiver URL the hooks post to (omit to write to the local DB)')
+    s.add_argument('--dry-run', action='store_true', help='print the merged settings, write nothing')
+    s.set_defaults(func=hooks_cli)
     s=sub.add_parser('trigger')
     s.add_argument('--url', default=DEFAULT_URL or f'http://{DEFAULT_HOST}:{DEFAULT_PORT}')
     s.add_argument('--token')

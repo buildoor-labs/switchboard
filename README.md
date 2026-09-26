@@ -30,6 +30,8 @@ switchboard search <query>   # keyword search over learnings + session events
 switchboard learnings        # list distilled, promoted learnings
 switchboard eval             # score sessions with a local model, promote good ones to learnings
 switchboard mcp              # run an MCP server (stdio) exposing recall to any agent
+switchboard hook <event>     # ingest one harness hook event from stdin (live capture)
+switchboard hooks install    # wire switchboard's capture hooks into a harness settings file
 switchboard task-create      # enqueue a task for a worker to lease
 switchboard task-lease       # lease the next task (multi-agent coordination)
 switchboard worker           # run a task worker
@@ -72,6 +74,36 @@ switchboard eval --workspace acme --limit 10 --promote --threshold 7
 switchboard search "connection pool exhaustion"
 ```
 
+## Live capture (hooks)
+
+Relays tail transcripts *after the fact*, which misses approval/permission decisions, is a
+few seconds behind, and captures nothing if a session is killed before it flushes. For
+harnesses that support hooks, switchboard can also capture **live**:
+
+```bash
+# wire capture hooks into Claude Code (idempotent; --dry-run to preview, uninstall to remove)
+switchboard hooks install --harness claude --url http://<receiver-host>:17888
+```
+
+Each hook runs `switchboard hook <event>`, which reads the hook payload on stdin, records a
+`collection_method=hook` event (tool calls, prompts, and allow/deny approval decisions), and
+prints a pass response — switchboard **observes, it never gates** a tool call. When both the
+tail and the hook capture the same action, they are de-duplicated (by tool-call id, else a
+short cross-path time window), keeping the higher-fidelity hook row. Every event carries
+`collection_method` (poll/hook) and `fidelity` so you can tell an observed action from an
+inferred one.
+
+## Privacy
+
+Ingest scrubs secrets (bearer tokens, API keys, `password:`/`token=` values, `sk-…` keys)
+from stored text before writing — on by default, and a `sha256` + true byte length of the
+*original* is kept so truncation and duplicates are still detectable. Retention is a knob:
+
+- `SWITCHBOARD_RETENTION=full` (default) — store secret-redacted text.
+- `SWITCHBOARD_RETENTION=redacted` — force redaction on even if `SWITCHBOARD_REDACT=0`.
+- `SWITCHBOARD_RETENTION=metadata_only` — keep actions, models, tool/file names, paths and
+  provenance, but no message text.
+
 ## Quickstart
 
 ```bash
@@ -102,6 +134,9 @@ All via environment variables:
 | `SWITCHBOARD_EVAL_MODEL` | `local` — the judge model name |
 | `SWITCHBOARD_EVAL_API_KEY` | unset — sent as a bearer token to the eval endpoint if set |
 | `SWITCHBOARD_NOTES_DIR` | `~/.switchboard/notes` — where promoted learnings are mirrored as markdown |
+| `SWITCHBOARD_REDACT` | `1` — scrub secrets from stored text at ingest; set `0`/`false` to disable |
+| `SWITCHBOARD_RETENTION` | `full` — `full` / `redacted` / `metadata_only` (see Privacy) |
+| `SWITCHBOARD_NO_FTS5` | unset — force the `LIKE` search path even when SQLite has FTS5 |
 
 ## Notes
 
