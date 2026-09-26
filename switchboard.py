@@ -3253,14 +3253,20 @@ def relay(args):
 
 # ---------- eval / learning promotion (local-model judge) ----------
 
-EVAL_SYSTEM = (
-    "You are a strict reviewer of coding-agent work sessions. Given a session transcript, judge how "
-    "useful and reusable the session is as durable memory for a FUTURE agent, and distill its "
-    "transferable knowledge. Score 1-10: 1 = trivial/noise (chit-chat, aborted, nothing learned), "
-    "10 = a hard problem solved with a non-obvious fix, decision, or gotcha worth remembering. "
-    "Reply with ONLY a JSON object, no prose: "
-    '{"score": <int 1-10>, "reason": "<one sentence>", "title": "<=8 words>", '
-    '"note": "<2-6 sentences: what was done, the key decisions, any gotcha, and how to apply it next time>"}'
+# The Jev pattern: a cheap, ideally NON-GENERATIVE decision model gates promotion;
+# the expensive generative model only synthesizes the note for sessions that pass.
+DECISION_SYSTEM = (
+    "You are a fast gate deciding whether a coding-agent session is worth saving as durable, "
+    "reusable memory for a future agent. Reply with ONLY a JSON object, no prose: "
+    '{"promote": <bool>, "score": <int 1-10>, "outcome": "success|partial|failed", '
+    '"title": "<=8 words>", "reason": "<one sentence>"}. '
+    "promote=true ONLY if the session actually solved a real, non-obvious problem and leaves "
+    "transferable knowledge (a fix, decision, or gotcha). Idle chat, aborted or trivial work = false."
+)
+SYNTH_SYSTEM = (
+    "Write the durable note for this solved coding session. Reply with ONLY a JSON object: "
+    '{"title": "<=8 words>", "note": "<2-6 sentences: what was done, the key decisions, any gotcha, '
+    'and how to apply it next time>"}'
 )
 
 
@@ -3289,12 +3295,95 @@ def parse_judge_json(text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def call_decision_endpoint(url: str, token: str | None, question: str, options: list[str], context: str, timeout: int = 30) -> dict[str, Any]:
+    """POST to a Jev-style typed-decision endpoint (Ollaya / TypeSafe `/v1/decisions`-compatible).
+    Non-generative: returns a chosen option + confidence, not prose. Parsed leniently across shapes."""
+    body=json.dumps({"question": question, "options": options, "input": context, "context": context}).encode()
+    headers={"content-type":"application/json"}
+    if token: headers["authorization"]=f"Bearer {token}"
+    req=urllib.request.Request(url.rstrip('/') + '/v1/decisions', data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data=json.loads(r.read())
+    res=data.get("result") if isinstance(data.get("result"), dict) else data
+    choice=res.get("choice") or res.get("decision") or res.get("label") or res.get("answer")
+    conf=res.get("confidence"); conf=res.get("score") if conf is None else conf
+    return {"choice": choice, "confidence": conf, "raw": data}
+
+
+def decide_session(args, tx: str, base_url: str, model: str, api_key: str | None) -> dict[str, Any]:
+    """The cheap gate. Uses a typed-decision endpoint when configured, else the generative model."""
+    decision_url=args.decision_url or os.environ.get("SWITCHBOARD_DECISION_URL")
+    decision_token=args.decision_token or os.environ.get("SWITCHBOARD_DECISION_TOKEN")
+    if decision_url:
+        d=call_decision_endpoint(decision_url, decision_token,
+            "Is this coding-agent session worth saving as durable, reusable memory?",
+            ["promote", "skip"], tx[:args.max_chars])
+        choice=str(d.get("choice") or "").lower(); conf=d.get("confidence")
+        promote=choice.startswith("promote") or choice in ("yes", "true", "1")
+        if isinstance(conf, (int, float)):
+            score=int(round(conf*10)) if 0 <= conf <= 1 else int(conf)
+        else:
+            score=8 if promote else 2
+        return {"backend": "decision-endpoint", "promote": promote, "score": score,
+                "outcome": None, "title": None, "reason": f"decision-endpoint choice={d.get('choice')} confidence={conf}"}
+    v=parse_judge_json(call_judge(base_url, model, api_key, DECISION_SYSTEM, tx[:args.max_chars]))
+    return {"backend": "generative", "promote": bool(v.get("promote")), "score": int(v.get("score") or 0),
+            "outcome": v.get("outcome"), "title": v.get("title"), "reason": v.get("reason")}
+
+
+def synthesize_learning(tx: str, base_url: str, model: str, api_key: str | None, max_chars: int) -> tuple[str | None, str | None]:
+    v=parse_judge_json(call_judge(base_url, model, api_key, SYNTH_SYSTEM, tx[:max_chars]))
+    return v.get("title"), v.get("note")
+
+
+def session_outcome_signal(args, sid: str) -> str | None:
+    """Objective corroboration from the event stream: 'failed' if the latest exit code is non-zero,
+    'success' if it's zero, else None (unknown). Best-effort; only used to BLOCK on a hard failure."""
+    try:
+        if args.url:
+            rows=fetch_remote(args.url, '/session/' + urllib.parse.quote(sid, safe=''), {'limit': 40}, args.token).get('events', [])
+        else:
+            rows=[rowdict(r) for r in connect(args.db).execute(
+                'SELECT exit_code FROM events WHERE session_id=? ORDER BY ts DESC LIMIT 40', (sid,)).fetchall()]
+    except Exception:
+        return None
+    for e in rows:  # rows are newest-first; first non-null exit code wins
+        code=e.get("exit_code")
+        if code is not None:
+            return "failed" if code != 0 else "success"
+    return None
+
+
+def _title_tokens(title: str | None) -> set[str]:
+    return {t.lower() for t in re.findall(r"\w+", title or "") if len(t) > 3}
+
+
+def is_duplicate_learning(args, workspace: str | None, title: str | None) -> bool:
+    """Non-duplication gate: skip promotion if a near-identical learning already exists (title Jaccard >= 0.6)."""
+    terms=_title_tokens(title)
+    if not terms:
+        return False
+    q=" ".join(terms)
+    try:
+        if args.url:
+            existing=fetch_remote(args.url, '/search', {'q': q, 'workspace': workspace, 'limit': 10}, args.token).get('learnings', [])
+        else:
+            existing=search_learnings(connect(args.db), q, workspace=workspace, limit=10)
+    except Exception:
+        return False
+    for l in existing:
+        et=_title_tokens(l.get("title"))
+        if et and len(terms & et) / len(terms | et) >= 0.6:
+            return True
+    return False
+
+
 def eval_cli(args):
     base_url=args.base_url or os.environ.get("SWITCHBOARD_EVAL_BASE_URL")
     model=args.model or os.environ.get("SWITCHBOARD_EVAL_MODEL", "local")
     api_key=args.api_key or os.environ.get("SWITCHBOARD_EVAL_API_KEY")
     if not base_url:
-        raise SystemExit("set --base-url or SWITCHBOARD_EVAL_BASE_URL to an OpenAI-compatible endpoint")
+        raise SystemExit("set --base-url or SWITCHBOARD_EVAL_BASE_URL (used for note synthesis, and as the decision fallback)")
     con=None if args.url else connect(args.db)
     if args.session:
         targets=[{"session_id": args.session}]
@@ -3313,29 +3402,52 @@ def eval_cli(args):
         if not tx or tx.startswith("No events"):
             results.append({"session_id": sid, "skipped": "no transcript"}); continue
         try:
-            verdict=parse_judge_json(call_judge(base_url, model, api_key, EVAL_SYSTEM, tx[:args.max_chars]))
+            decision=decide_session(args, tx, base_url, model, api_key)  # cheap gate
         except Exception as e:
             results.append({"session_id": sid, "error": f"{type(e).__name__}: {e}"}); continue
-        score=int(verdict.get("score") or 0)
-        entry={"session_id": sid, "score": score, "title": verdict.get("title"), "reason": verdict.get("reason"), "promoted": False}
-        if args.promote and score >= args.threshold and verdict.get("note"):
-            payload={
-                "session_id": sid, "workspace": s.get("workspace") or args.workspace, "cwd": s.get("cwd"),
-                "harness": s.get("harness"), "source_machine": s.get("source_machine"), "score": score,
-                "title": verdict.get("title"), "note": verdict.get("note"), "reason": verdict.get("reason"), "model": model,
-            }
-            if args.url:
-                command_http(args.url, "POST", "/learnings", payload, token=args.token)
-            else:
-                promote_learning(con, payload)
-            notes_dir.mkdir(parents=True, exist_ok=True)
-            fn=notes_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', sid)}.md"
-            fn.write_text(
-                f"---\nsession: {sid}\nworkspace: {payload['workspace']}\nharness: {payload['harness']}\n"
-                f"score: {score}\nmodel: {model}\n---\n\n# {verdict.get('title') or 'Learning'}\n\n"
-                f"{verdict.get('note')}\n\n_{verdict.get('reason','')}_\n"
-            )
-            entry["promoted"]=True; entry["note_file"]=str(fn)
+        score=decision["score"]; obj=session_outcome_signal(args, sid)
+        entry={"session_id": sid, "backend": decision["backend"], "score": score,
+               "promote_decision": decision["promote"], "outcome": decision.get("outcome"),
+               "objective_signal": obj, "promoted": False}
+        # gates, cheapest first
+        gate=None
+        if not decision["promote"]:
+            gate="decision:skip"
+        elif score < args.threshold:
+            gate=f"score<{args.threshold}"
+        elif decision.get("outcome") == "failed" or obj == "failed":
+            gate="outcome:failed"
+        if gate or not args.promote:
+            entry["gate"]=gate or "not-promoting"
+            results.append(entry); continue
+        title=decision.get("title")
+        if title and is_duplicate_learning(args, s.get("workspace") or args.workspace, title):
+            entry["gate"]="duplicate"; results.append(entry); continue
+        # passed the cheap gate — spend the generative model on synthesis (winners only)
+        syn_title, note=synthesize_learning(tx, base_url, model, api_key, args.max_chars)
+        title=title or syn_title
+        if not note:
+            entry["gate"]="no-note"; results.append(entry); continue
+        if is_duplicate_learning(args, s.get("workspace") or args.workspace, title):
+            entry["gate"]="duplicate"; results.append(entry); continue
+        payload={
+            "session_id": sid, "workspace": s.get("workspace") or args.workspace, "cwd": s.get("cwd"),
+            "harness": s.get("harness"), "source_machine": s.get("source_machine"), "score": score,
+            "title": title, "note": note, "reason": decision.get("reason"),
+            "model": f"{decision['backend']}+{model}",
+        }
+        if args.url:
+            command_http(args.url, "POST", "/learnings", payload, token=args.token)
+        else:
+            promote_learning(con, payload)
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        fn=notes_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', sid)}.md"
+        fn.write_text(
+            f"---\nsession: {sid}\nworkspace: {payload['workspace']}\nharness: {payload['harness']}\n"
+            f"score: {score}\ndecision_backend: {decision['backend']}\nmodel: {model}\n---\n\n# {title or 'Learning'}\n\n"
+            f"{note}\n\n_{decision.get('reason','')}_\n"
+        )
+        entry["title"]=title; entry["promoted"]=True; entry["note_file"]=str(fn)
         results.append(entry)
     print(json.dumps(results, indent=2, ensure_ascii=False))
 
@@ -3452,9 +3564,11 @@ def main(argv=None):
     s.add_argument('--session', help='score this exact session_id (else the most recent sessions)')
     s.add_argument('--workspace'); s.add_argument('--limit',type=int,default=5,help='sessions to score when --session is omitted')
     s.add_argument('--transcript-limit',type=int,default=400); s.add_argument('--max-chars',type=int,default=24000)
-    s.add_argument('--base-url',help='OpenAI-compatible endpoint (or SWITCHBOARD_EVAL_BASE_URL)')
-    s.add_argument('--model',help='judge model (or SWITCHBOARD_EVAL_MODEL, default "local")')
+    s.add_argument('--base-url',help='OpenAI-compatible endpoint for note synthesis + generative decision fallback (or SWITCHBOARD_EVAL_BASE_URL)')
+    s.add_argument('--model',help='synthesis model (or SWITCHBOARD_EVAL_MODEL, default "local")')
     s.add_argument('--api-key',help='or SWITCHBOARD_EVAL_API_KEY')
+    s.add_argument('--decision-url',help='Jev-style typed-decision endpoint (Ollaya/TypeSafe /v1/decisions); if unset, the generative model makes the decision (or SWITCHBOARD_DECISION_URL)')
+    s.add_argument('--decision-token',help='bearer token for the decision endpoint (or SWITCHBOARD_DECISION_TOKEN)')
     s.add_argument('--threshold',type=int,default=7,help='promote sessions scoring >= this (1-10)')
     s.add_argument('--promote',action='store_true',help='write learnings for sessions that clear the threshold')
     s.add_argument('--notes-dir',help='markdown mirror dir (or SWITCHBOARD_NOTES_DIR)')

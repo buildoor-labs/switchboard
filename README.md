@@ -62,14 +62,26 @@ falls back to local. Tools exposed: `switchboard_search`, `switchboard_digest`,
 
 ## Learning layer
 
-`switchboard eval` sends recent session transcripts to any OpenAI-compatible model (a local
-one works well and keeps it free and private), scores each 1–10 on how reusable it is as
-durable memory, and — with `--promote` — distills the ones that clear a threshold into
-**learnings**: short, titled notes that `switchboard search` and the MCP `search` tool
-surface *above* raw events. A promoted learning is also mirrored to a markdown file.
+`switchboard eval` reviews recent sessions and — with `--promote` — distills the good ones
+into **learnings**: short, titled notes that `switchboard search` and the MCP `search` tool
+surface *above* raw events (also mirrored to markdown).
+
+It follows the cheap-gate/expensive-work pattern: a **decision** step (should this session be
+saved at all?) runs first and cheaply; only sessions that pass get an **expensive synthesis**
+call to write the note. Promotion also has to clear three gates — the decision itself, an
+objective outcome check (a session whose last exit code was non-zero is not promoted), and
+**non-duplication** (a near-identical existing learning blocks it).
+
+The decision is *pluggable*. By default the same generative model makes it, but point
+`--decision-url` at a **non-generative typed-decision endpoint** (Jev-style — e.g.
+[Ollaya](https://github.com/ollaya-dev/ollaya) serving a Rev/Laya head at `/v1/decisions`) and
+the gate becomes a calibrated, split-second classifier while the generative model is used only
+to write notes for the winners.
 
 ```bash
-export SWITCHBOARD_EVAL_BASE_URL=http://localhost:8080/v1   # any OpenAI-compatible endpoint
+export SWITCHBOARD_EVAL_BASE_URL=http://localhost:8080/v1   # generative model: note synthesis (+ decision fallback)
+# optional: a fast typed-decision model as the gate
+export SWITCHBOARD_DECISION_URL=http://localhost:8090       # Ollaya/TypeSafe-compatible /v1/decisions
 switchboard eval --workspace acme --limit 10 --promote --threshold 7
 switchboard search "connection pool exhaustion"
 ```
@@ -131,7 +143,9 @@ All via environment variables:
 | `SWITCHBOARD_WORKSPACE_MAP` | `{}` — JSON mapping a cwd prefix to a workspace slug, e.g. `{"/home/you/code/acme": "acme"}` |
 | `SWITCHBOARD_CMD_TOKEN` | unset — the receiver is open on localhost; set a bearer token to require auth once you expose it |
 | `SWITCHBOARD_EVAL_BASE_URL` | unset — OpenAI-compatible endpoint for `switchboard eval` (e.g. a local model) |
-| `SWITCHBOARD_EVAL_MODEL` | `local` — the judge model name |
+| `SWITCHBOARD_EVAL_MODEL` | `local` — the synthesis model name |
+| `SWITCHBOARD_DECISION_URL` | unset — a Jev-style typed-decision endpoint (`/v1/decisions`) used as the promotion gate; falls back to the generative model when unset |
+| `SWITCHBOARD_DECISION_TOKEN` | unset — bearer token for the decision endpoint |
 | `SWITCHBOARD_EVAL_API_KEY` | unset — sent as a bearer token to the eval endpoint if set |
 | `SWITCHBOARD_NOTES_DIR` | `~/.switchboard/notes` — where promoted learnings are mirrored as markdown |
 | `SWITCHBOARD_REDACT` | `1` — scrub secrets from stored text at ingest; set `0`/`false` to disable |
