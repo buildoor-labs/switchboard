@@ -3309,7 +3309,8 @@ def _extract_prob(ans: Any) -> float | None:
     if isinstance(ans, (int, float)):
         return float(ans)
     if isinstance(ans, dict):
-        for k in ("probability", "prob", "confidence", "score", "value", "p_true", "true"):
+        # `noul` is the real TypeSafe/Ollaya wire shape: a noul answer is {"type":"noul","noul":0.85}
+        for k in ("noul", "probability", "prob", "confidence", "score", "value", "p_true", "true"):
             v=ans.get(k)
             if isinstance(v, bool):
                 return 1.0 if v else 0.0
