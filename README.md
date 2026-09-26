@@ -150,6 +150,7 @@ All via environment variables:
 | `SWITCHBOARD_EVAL_MODEL` | `local` — the synthesis model name |
 | `SWITCHBOARD_DECISION_URL` | unset — a TypeSafe `/v1/systemone` typed-decision endpoint used as the promotion gate; falls back to the generative model when unset |
 | `SWITCHBOARD_DECISION_MODEL` | `semif-qwen3.5-4b` — decision model name at that endpoint |
+| `SWITCHBOARD_DECISION_KIND` | `systemone` — endpoint contract; set `classify` for a classifier.dev-style `/v1/classify` (its free tier fronts Jev, no key) |
 | `SWITCHBOARD_DECISION_TOKEN` | unset — bearer token for the decision endpoint (e.g. a LangSmith API key) |
 | `SWITCHBOARD_EVAL_API_KEY` | unset — sent as a bearer token to the eval endpoint if set |
 | `SWITCHBOARD_NOTES_DIR` | `~/.switchboard/notes` — where promoted learnings are mirrored as markdown |

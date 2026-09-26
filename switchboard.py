@@ -3318,6 +3318,9 @@ def _extract_prob(ans: Any) -> float | None:
     return None
 
 
+CLASSIFY_LABELS = ["worth saving as durable reusable memory", "not worth saving"]
+
+
 def call_decision_endpoint(url: str, token: str | None, model: str, state: str, timeout: int = 30) -> dict[str, Any]:
     """POST to a TypeSafe `/v1/systemone` typed-decision endpoint (LangSmith Gateway / Ollaya / Jev).
     Non-generative: a `noul` question returns the probability the session is worth saving."""
@@ -3336,17 +3339,43 @@ def call_decision_endpoint(url: str, token: str | None, model: str, state: str, 
     return {"probability": prob, "raw": data}
 
 
+def call_classify_endpoint(url: str, token: str | None, state: str, labels: list[str] | None = None, timeout: int = 30) -> dict[str, Any]:
+    """POST to a `/v1/classify` zero-shot endpoint (classifier.dev-style; also fronts Jev).
+    Returns the probability of the first label (= worth saving)."""
+    labels=labels or CLASSIFY_LABELS
+    body=json.dumps({"input": state, "labels": labels}).encode()
+    headers={"content-type": "application/json"}
+    if token: headers["authorization"]=f"Bearer {token}"
+    req=urllib.request.Request(url.rstrip('/') + '/v1/classify', data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data=json.loads(r.read())
+    res=(data.get("results") or [{}])[0]
+    scores=res.get("scores") or {}
+    if labels[0] in scores:
+        prob=scores[labels[0]]
+    else:
+        conf=res.get("confidence")
+        prob=None if conf is None else (conf if res.get("label") == labels[0] else 1.0 - conf)
+    return {"probability": prob, "raw": data}
+
+
 def decide_session(args, tx: str, base_url: str, model: str, api_key: str | None) -> dict[str, Any]:
     """The cheap gate. Uses a typed-decision endpoint when configured, else the generative model."""
     decision_url=args.decision_url or os.environ.get("SWITCHBOARD_DECISION_URL")
     decision_token=args.decision_token or os.environ.get("SWITCHBOARD_DECISION_TOKEN")
     if decision_url:
-        decision_model=args.decision_model or os.environ.get("SWITCHBOARD_DECISION_MODEL", "semif-qwen3.5-4b")
-        d=call_decision_endpoint(decision_url, decision_token, decision_model, tx[:args.max_chars])
+        kind=getattr(args, "decision_kind", None) or os.environ.get("SWITCHBOARD_DECISION_KIND", "systemone")
+        if kind == "classify":
+            d=call_classify_endpoint(decision_url, decision_token, tx[:args.max_chars])
+            backend="decision:classify"
+        else:
+            decision_model=args.decision_model or os.environ.get("SWITCHBOARD_DECISION_MODEL", "semif-qwen3.5-4b")
+            d=call_decision_endpoint(decision_url, decision_token, decision_model, tx[:args.max_chars])
+            backend=f"decision:{decision_model}"
         prob=d.get("probability")
         promote=(prob is not None) and prob >= (args.threshold / 10.0)
         score=int(round(prob*10)) if isinstance(prob, (int, float)) else 0
-        return {"backend": f"decision:{decision_model}", "promote": promote, "score": score,
+        return {"backend": backend, "promote": promote, "score": score,
                 "outcome": None, "title": None, "reason": f"decision p(save)={prob}"}
     v=parse_judge_json(call_judge(base_url, model, api_key, DECISION_SYSTEM, tx[:args.max_chars]))
     return {"backend": "generative", "promote": bool(v.get("promote")), "score": int(v.get("score") or 0),
@@ -3590,6 +3619,7 @@ def main(argv=None):
     s.add_argument('--model',help='synthesis model (or SWITCHBOARD_EVAL_MODEL, default "local")')
     s.add_argument('--api-key',help='or SWITCHBOARD_EVAL_API_KEY')
     s.add_argument('--decision-url',help='TypeSafe /v1/systemone typed-decision endpoint (LangSmith Gateway https://gateway.smith.langchain.com, or self-hosted Ollaya); if unset, the generative model decides (or SWITCHBOARD_DECISION_URL)')
+    s.add_argument('--decision-kind',choices=['systemone','classify'],help='endpoint contract: systemone (default) or classify (classifier.dev /v1/classify) (or SWITCHBOARD_DECISION_KIND)')
     s.add_argument('--decision-model',help='decision model name, e.g. semif-qwen3.5-4b (or SWITCHBOARD_DECISION_MODEL)')
     s.add_argument('--decision-token',help='bearer token for the decision endpoint, e.g. LANGSMITH_API_KEY (or SWITCHBOARD_DECISION_TOKEN)')
     s.add_argument('--threshold',type=int,default=7,help='promote sessions scoring >= this (1-10)')
