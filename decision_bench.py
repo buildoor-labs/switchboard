@@ -23,7 +23,7 @@ A candidate is one JSON object:
    "model": "semif-qwen3.5-4b", "token_env": "LANGSMITH_API_KEY"}
   {"name": "jev",    "kind": "systemone", "url": "https://gateway.smith.langchain.com",
    "model": "typesafe/jev-1.13.0", "token_env": "LANGSMITH_API_KEY"}
-  {"name": "decider-4b", "kind": "systemone", "url": "http://models-vm:8000", "model": "Mapika/decider-4b"}
+  {"name": "decider-4b", "kind": "systemone", "url": "http://localhost:8000", "model": "Mapika/decider-4b"}
   {"name": "gen-27b", "kind": "generative", "url": "http://localhost:8080/v1", "model": "local"}
 """
 from __future__ import annotations
