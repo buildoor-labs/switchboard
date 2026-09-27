@@ -20,11 +20,12 @@ Wants=network-online.target
 Environment=CUDA_VISIBLE_DEVICES=0
 # Keep the HF cache + weights on the big share, never the root disk.
 Environment=HF_HOME=<MODEL_SHARE>/hf-cache
-# Rev-4B is ~9GB bf16; trim CUDA-graph warmup so startup doesn't briefly want ~15GB
-# (this is what let it fit alongside other models during the bake-off).
-Environment=DECIDER_WARMUP=0
+# Rev-4B is ~9GB bf16 (no CUDA-graph warmup grid — a single warm-up forward pass), so it
+# needs a card with ~10GB+ free. On a 12GB 3060 it fits alone; don't co-locate a second model.
 WorkingDirectory=<REV_CHECKOUT>
-ExecStart=<REV_CHECKOUT>/venv-rev/bin/python serve_local.py --model Mapika/rev-qwen3.5-4b --host 127.0.0.1 --port 8093
+# serve_local.py takes --repo (the HF repo id), not --model. Rev-4B is robbalian/rev-qwen3.5-4b
+# (Mapika/* is the separate `decider` project). Swap to rev-qwen3.5-9b for the accuracy tier.
+ExecStart=<REV_CHECKOUT>/venv-rev/bin/python serve_local.py --repo robbalian/rev-qwen3.5-4b --host 127.0.0.1 --port 8093
 Restart=always
 RestartSec=5
 # Don't thrash if it can't start (e.g. OOM on too-small a card): back off after repeated fails.
