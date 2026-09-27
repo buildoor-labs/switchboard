@@ -1,0 +1,35 @@
+# Rev decision-model judge for switchboard's learning-layer gate.
+# A systemd *user* unit (install to ~/.config/systemd/user/rev-judge.service).
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rev-judge.service
+#   loginctl enable-linger $USER      # so it survives logout / starts at boot
+#
+# Then point switchboard at it:
+#   switchboard eval --decision-url http://<this-host>:8093 --decision-kind rev --promote
+#
+# Edit the paths/values marked <...> for the host it runs on.
+[Unit]
+Description=Rev-4B decision judge (switchboard promotion gate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Pin to one GPU. On a dedicated small card (e.g. a 12GB 3060) this is the only device,
+# so "0" is correct there too; on a shared multi-GPU box set it to the free card's index.
+Environment=CUDA_VISIBLE_DEVICES=0
+# Keep the HF cache + weights on the big share, never the root disk.
+Environment=HF_HOME=<MODEL_SHARE>/hf-cache
+# Rev-4B is ~9GB bf16; trim CUDA-graph warmup so startup doesn't briefly want ~15GB
+# (this is what let it fit alongside other models during the bake-off).
+Environment=DECIDER_WARMUP=0
+WorkingDirectory=<REV_CHECKOUT>
+ExecStart=<REV_CHECKOUT>/venv-rev/bin/python serve_local.py --model Mapika/rev-qwen3.5-4b --host 127.0.0.1 --port 8093
+Restart=always
+RestartSec=5
+# Don't thrash if it can't start (e.g. OOM on too-small a card): back off after repeated fails.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target
